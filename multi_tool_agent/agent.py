@@ -1,81 +1,115 @@
-import fitz  # PyMuPDF
-from google.adk.agents import Agent
 import os
+from pathlib import Path
+import fitz  # PyMuPDF
+import google.generativeai as genai
+import streamlit as st # Ditambahkan untuk mengakses secrets saat deploy
 
-def get_pdf_content(file_path: str) -> str:
-    """
-    Membaca dan mengekstrak seluruh teks dari file PDF.
-    Mengembalikan teks lengkap atau string kosong jika gagal.
-    """
+# --- Konfigurasi API Key ---
+# Fungsi ini akan mencoba mengambil API key dari secrets Streamlit (saat deploy)
+# atau dari environment variable (saat dijalankan lokal dengan file .env)
+def configure_genai():
+    """Mengkonfigurasi API Key Google AI."""
+    api_key = None
     try:
-        if not os.path.exists(file_path):
-            print(f"PERINGATAN: File tidak ditemukan di path: {file_path}")
-            return ""
-            
-        doc = fitz.open(file_path)
-        full_text = ""
-        for page in doc:
-            full_text += page.get_text() + "\n\n" 
-        
-        if not full_text.strip():
-            print(f"Peringatan: Dokumen PDF {file_path} kosong atau tidak dapat dibaca.")
-            return ""
-        
-        return full_text
-    except Exception as e:
-        print(f"ERROR: Terjadi kesalahan saat membaca file PDF {file_path}: {str(e)}")
-        return ""
+        # Prioritas pertama: Coba ambil dari secrets Streamlit
+        api_key = st.secrets.get("GOOGLE_API_KEY")
+    except (AttributeError, FileNotFoundError):
+        # Jika gagal (misalnya berjalan lokal), coba ambil dari environment variable
+        print("Secrets Streamlit tidak ditemukan, mencoba environment variable...")
+        api_key = os.getenv("GOOGLE_API_KEY")
 
-# --- Langkah Utama ---
-# 1. Tentukan path ke semua file PDF yang relevan untuk hukum korupsi
-LAW_FILES_DIR = "multi_tool_agent/"
-LAW_FILE_PATHS = [
-    os.path.join(LAW_FILES_DIR, "UU Nomor 31 Tahun 1999.pdf"),
-    os.path.join(LAW_FILES_DIR, "UU Nomor 19 Tahun 2019.pdf"),
-    os.path.join(LAW_FILES_DIR, "UU Nomor 8 Tahun 2010.pdf"),
-    os.path.join(LAW_FILES_DIR, "Kitab-Undang-undang-Hukum-Pidana_KUHP.pdf"),
-    os.path.join(LAW_FILES_DIR, "part 1.pdf") # Yurisprudensi MA
-]
+    if api_key:
+        genai.configure(api_key=api_key)
+        print("API Key Google AI berhasil dikonfigurasi.")
+    else:
+        # Jika keduanya gagal, tampilkan error yang jelas
+        error_message = "API Key Google AI tidak ditemukan. Pastikan Anda sudah mengatur GOOGLE_API_KEY di Secrets Streamlit (untuk deployment) atau di file .env (untuk lokal)."
+        print(error_message)
+        st.error(error_message) # Tampilkan juga di UI Streamlit
 
-# 2. Baca konten dari semua PDF untuk dijadikan konteks gabungan
-all_law_context = ""
-print("Memuat dokumen hukum...")
-for path in LAW_FILE_PATHS:
-    print(f"Membaca file: {os.path.basename(path)}")
-    content = get_pdf_content(path)
-    if content:
-        all_law_context += f"--- DOKUMEN DARI FILE: {os.path.basename(path)} ---\n\n"
-        all_law_context += content
-        all_law_context += "\n\n--- AKHIR DOKUMEN ---\n\n"
-
-# 3. Buat instruksi yang sangat detail untuk agen
-# Pastikan konteks berhasil dimuat sebelum membuat agent
-if all_law_context:
-    instruction = f"""
-    Anda adalah seorang ahli hukum Indonesia dengan spesialisasi tinggi dalam bidang tindak pidana korupsi.
-    Tugas utama Anda adalah untuk menjawab semua pertanyaan pengguna secara akurat, komprehensif, dan mudah dipahami **hanya berdasarkan teks lengkap dari peraturan perundang-undangan dan yurisprudensi** yang telah disediakan di bawah ini.
-    Jangan gunakan pengetahuan eksternal atau informasi dari sumber lain. Semua jawaban Anda harus merujuk kembali ke pasal-pasal atau bagian dalam dokumen-dokumen ini.
-
-    Berikut adalah isi lengkap dari peraturan perundang-undangan yang menjadi satu-satunya sumber pengetahuan Anda:
-    
-    {all_law_context}
-    
-    Saat menjawab, ikuti panduan berikut:
-    1.  **Akurasi Tinggi**: Pastikan setiap jawaban didasarkan sepenuhnya pada teks yang diberikan.
-    2.  **Sebutkan Sumber**: Wajib mengutip dasar hukum dari jawaban Anda (contoh: "Berdasarkan Pasal 2 UU No. 31 Tahun 1999...").
-    3.  **Jawaban Terstruktur**: Sajikan jawaban dengan jelas dan logis. Gunakan poin-poin jika diperlukan untuk menjelaskan konsep yang kompleks.
-    4.  **Netral dan Objektif**: Jangan memberikan opini pribadi. Tetaplah berpegang pada interpretasi hukum yang ada dalam dokumen.
+class SimpleRAG:
     """
-else:
-    # Fallback jika PDF gagal dimuat
-    instruction = "Peringatan: Konten hukum korupsi tidak dapat dimuat. Saya tidak bisa menjawab pertanyaan dengan akurat."
+    Kelas sederhana untuk melakukan Retrieval-Augmented Generation.
+    Dia akan memuat dokumen dan memberikan konteks yang relevan ke model AI.
+    """
+    def __init__(self):
+        self.texts = self._load_documents()
+        if self.texts: # Hanya inisialisasi model jika dokumen berhasil dimuat
+            self.model = genai.GenerativeModel("gemini-1.5-flash-latest")
+        else:
+            self.model = None
+            print("Model tidak diinisialisasi karena tidak ada dokumen yang berhasil dimuat.")
 
-# 4. Definisikan `root_agent` yang akan dimuat oleh server ADK
-root_agent = Agent(
-    name="corruption_law_expert_agent",
-    model="gemini-2.0-flash",
-    description="Agent ahli hukum yang berspesialisasi dalam tindak pidana korupsi berdasarkan dokumen hukum yang disediakan.",
-    instruction=instruction
-)
+    @st.cache_data(show_spinner=False) # Menggunakan cache agar PDF tidak dimuat ulang setiap saat
+    def _load_documents(_self):
+        """Memuat semua file PDF menjadi satu dictionary teks."""
+        BASE_DIR = Path(__file__).parent.absolute()
+        file_names = [
+            "UUD45 ASLI.pdf",
+            "UU Nomor 31 Tahun 1999.pdf",
+            "UU Nomor 19 Tahun 2019.pdf",
+            "UU Nomor  8 Tahun 2010.pdf",
+            "Kitab-Undang-undang-Hukum-Pidana_KUHP.pdf",
+            "part 1.pdf",
+            "UUD45 ASLI.pdf"
+        ]
+        
+        all_texts = {}
+        print("Memuat dokumen hukum...")
+        for file_name in file_names:
+            file_path = BASE_DIR / file_name
+            if file_path.exists():
+                print(f"Membaca file: {file_name}")
+                try:
+                    with fitz.open(file_path) as doc:
+                        all_texts[file_name] = "".join(page.get_text() for page in doc)
+                except Exception as e:
+                    print(f"Gagal membaca {file_name} karena error: {e}")
+            else:
+                print(f"PERINGATAN: File tidak ditemukan di {file_path}")
+        
+        if not all_texts:
+            st.error("Tidak ada dokumen PDF yang berhasil dimuat. Pastikan file PDF ada di dalam folder yang sama dengan agent.py dan tidak rusak.")
 
-print("✅ Corruption Law Expert Agent berhasil didefinisikan dan siap dimuat oleh server ADK.")
+        print("✅ Dokumen berhasil dimuat.")
+        return all_texts
+
+    def query(_self, question: str) -> str:
+        """Menjawab pertanyaan menggunakan konteks dari dokumen."""
+        if not _self.model:
+            return "Model AI tidak dapat digunakan karena dokumen gagal dimuat atau API Key tidak valid."
+
+        # Menggabungkan semua teks dari PDF menjadi satu konteks besar
+        context = "\n\n--- PEMISAH DOKUMEN ---\n\n".join(_self.texts.values())
+
+        # Membuat prompt yang terstruktur untuk model AI
+        system_instruction = (
+            "Anda adalah AI Ahli Hukum yang berspesialisasi dalam tindak pidana korupsi di Indonesia. "
+            "Jawab pertanyaan pengguna HANYA berdasarkan konteks dari dokumen hukum yang disediakan di bawah ini. "
+            "Setiap jawaban HARUS menyertakan sumber hukumnya (contoh: Berdasarkan Pasal X Undang-Undang Y...)."
+        )
+        
+        prompt = f"""
+        {system_instruction}
+
+        --- AWAL DARI KONTEKS DOKUMEN HUKUM ---
+        {context}
+        --- AKHIR DARI KONTEKS DOKUMEN HUKUM ---
+
+        PERTANYAAN PENGGUNA:
+        {question}
+
+        JAWABAN ANDA:
+        """
+
+        try:
+            response = _self.model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            return f"Terjadi kesalahan saat menghubungi model AI: {e}"
+
+# --- Inisialisasi Agent ---
+# Pertama, konfigurasikan API key
+configure_genai()
+# Kemudian, buat satu instance dari RAG agent kita
+rag_agent = SimpleRAG()
